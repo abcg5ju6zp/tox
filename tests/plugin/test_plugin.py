@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import sys
+from types import FrameType, ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
@@ -13,17 +15,24 @@ from tox.config.loader.memory import MemoryLoader
 from tox.config.sets import ConfigSet, CoreConfigSet, EnvConfigSet
 from tox.execute import Outcome
 from tox.plugin import impl
-from tox.plugin.manager import Plugin
+from tox.plugin.manager import MANAGER, Plugin
 from tox.pytest import ToxProjectCreator, register_inline_plugin
 from tox.session.state import State
 from tox.tox_env.api import ToxEnv
-from tox.tox_env.register import ToxEnvRegister
+from tox.tox_env.register import REGISTER, ToxEnvRegister
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    import pluggy
     from pytest_mock import MockerFixture
+
+
+def _noop_command(state: State) -> int:  # ruff:ignore[unused-function-argument]
+    return 0
+
+
+def _ignore_signal(signum: int, frame: FrameType | None) -> None:  # ruff:ignore[unused-function-argument]
+    return None
 
 
 def test_plugin_hooks_and_order(tox_project: ToxProjectCreator, mocker: MockerFixture) -> None:
@@ -299,13 +308,17 @@ def test_disable_external_plugins(
         def tox_add_option(parser: ToxParser) -> None:  # ruff:ignore[unused-static-method-argument]
             logging.warning("dummy plugin B called")
 
-    def fake_load_entrypoints(self: pluggy.PluginManager, name: str) -> None:  # ruff:ignore[unused-function-argument]
-        self.register(DummyPluginA(), name="dummy_plugin_a")
-        self.register(DummyPluginB(), name="dummy_plugin_b")
+    def fake_discover_entry_points() -> list[tuple[Any, Any]]:
+        dist_a = SimpleNamespace(metadata={"Name": "dummy-plugin-a"}, version="1")
+        dist_b = SimpleNamespace(metadata={"Name": "dummy-plugin-b"}, version="1")
+        return [
+            (SimpleNamespace(name="dummy_plugin_a", load=DummyPluginA), dist_a),
+            (SimpleNamespace(name="dummy_plugin_b", load=DummyPluginB), dist_b),
+        ]
 
     project = tox_project({"tox.ini": ""})
     with (
-        patch("pluggy.PluginManager.load_setuptools_entrypoints", fake_load_entrypoints),
+        patch("tox.plugin.manager._discover_entry_points", fake_discover_entry_points),
         patch("tox.plugin.manager.MANAGER", Plugin()),
         patch.dict(os.environ, {"TOX_DISABLED_EXTERNAL_PLUGINS": env_val}, clear=False),
     ):
@@ -314,3 +327,155 @@ def test_disable_external_plugins(
     result.assert_success()
     assert ("dummy plugin A called" in result.out) == expect_a
     assert ("dummy plugin B called" in result.out) == expect_b
+
+
+def _entry_point(name: str, load: Any, *, project: str | None = None, version: str = "1.0") -> tuple[Any, Any]:
+    dist = SimpleNamespace(metadata={"name": project or name}, version=version)
+    return SimpleNamespace(name=name, load=load), dist
+
+
+def test_external_plugin_import_error_does_not_break_session(tox_project: ToxProjectCreator) -> None:
+    class GoodPlugin:
+        @staticmethod
+        @impl
+        def tox_add_option(parser: ToxParser) -> None:
+            logging.warning("good plugin loaded")
+            parser.add_argument("--good-plugin-flag", action="store_true")
+
+    missing_dependency = "No module named 'broken_dependency'"
+
+    def broken_load() -> Any:
+        raise ImportError(missing_dependency)
+
+    def fake_discover_entry_points() -> list[tuple[Any, Any]]:
+        return [
+            _entry_point("good_plugin", GoodPlugin),
+            _entry_point("broken_plugin", broken_load),
+        ]
+
+    project = tox_project({"tox.ini": ""})
+    with patch("tox.plugin.manager._discover_entry_points", fake_discover_entry_points):
+        result = project.run("-h")
+
+    result.assert_success()
+    assert "good plugin loaded" in result.out
+    assert "--good-plugin-flag" in result.out
+    assert "external plugin 'broken_plugin' skipped: ImportError: No module named 'broken_dependency'" in result.out
+    assert [error.name for error in MANAGER.load_errors] == ["broken_plugin"]
+    # the good plugin still shows up in the version output, the broken one does not
+    with patch("tox.plugin.manager._discover_entry_points", fake_discover_entry_points):
+        version_result = project.run("--version")
+    assert "good_plugin-1.0" in version_result.out
+    assert "    broken_plugin" not in version_result.out  # not among the registered plugins
+
+
+def test_external_plugin_command_conflict_is_skipped(tox_project: ToxProjectCreator) -> None:
+    class GoodPlugin:
+        @staticmethod
+        @impl
+        def tox_add_option(parser: ToxParser) -> None:
+            parser.add_command("good-cmd", [], "the good command", _noop_command)
+
+    class ConflictingPlugin:
+        @staticmethod
+        @impl
+        def tox_add_option(parser: ToxParser) -> None:
+            # clashes with the built-in run command
+            parser.add_command("run", [], "duplicate run", _noop_command)
+
+    def fake_discover_entry_points() -> list[tuple[Any, Any]]:
+        return [
+            _entry_point("good_plugin", GoodPlugin),
+            _entry_point("conflicting_plugin", ConflictingPlugin),
+        ]
+
+    project = tox_project({"tox.ini": ""})
+    with patch("tox.plugin.manager._discover_entry_points", fake_discover_entry_points):
+        result = project.run("-h")
+
+    result.assert_success()
+    assert "good-cmd" in result.out
+    assert "external plugin 'conflicting_plugin' skipped: ValueError: conflicting subparser: run" in result.out
+    assert MANAGER.load_errors == (
+        ("conflicting_plugin", "ValueError: conflicting subparser: run"),
+    )
+
+
+def test_external_plugin_built_for_other_tox_version_is_skipped(tox_project: ToxProjectCreator) -> None:
+    class NewerToxPlugin:
+        @staticmethod
+        @impl
+        def tox_nonexistent_hook() -> None: ...
+
+    def fake_discover_entry_points() -> list[tuple[Any, Any]]:
+        return [_entry_point("newer_tox_plugin", NewerToxPlugin)]
+
+    project = tox_project({"tox.ini": ""})
+    with patch("tox.plugin.manager._discover_entry_points", fake_discover_entry_points):
+        result = project.run("l")
+
+    result.assert_success()
+    assert "external plugin 'newer_tox_plugin' skipped:" in result.out
+    assert "tox_nonexistent_hook" in MANAGER.load_errors[0].detail
+    assert not MANAGER.manager.has_plugin("newer_tox_plugin")
+
+
+def test_rejected_plugin_cannot_take_over_signals(tox_project: ToxProjectCreator) -> None:
+    previous_handler = signal.getsignal(signal.SIGINT)
+
+    class SignalHijacker:
+        @staticmethod
+        @impl
+        def tox_nonexistent_hook() -> None: ...
+
+    def load_and_install_handler() -> Any:
+        signal.signal(signal.SIGINT, _ignore_signal)
+        return SignalHijacker()
+
+    def fake_discover_entry_points() -> list[tuple[Any, Any]]:
+        return [_entry_point("signal_hijacker", load_and_install_handler)]
+
+    project = tox_project({"tox.ini": ""})
+    with patch("tox.plugin.manager._discover_entry_points", fake_discover_entry_points):
+        result = project.run("-h")
+
+    result.assert_success()
+    assert "external plugin 'signal_hijacker' skipped:" in result.out
+    assert signal.getsignal(signal.SIGINT) is previous_handler
+    assert not MANAGER.manager.has_plugin("signal_hijacker")
+
+
+def test_registry_generations_do_not_mix(tox_project: ToxProjectCreator, mocker: MockerFixture) -> None:
+    class CustomRunner:
+        @staticmethod
+        def id() -> str:
+            return "custom-runner"
+
+    inline_plugin = ModuleType("custom_runner_inline_plugin")
+    inline_plugin.__file__ = "/virtual/toxfile.py"
+
+    @impl
+    def tox_register_tox_env(register: ToxEnvRegister) -> None:
+        register.add_run_env(CustomRunner)  # type: ignore[arg-type]
+
+    inline_plugin.tox_register_tox_env = tox_register_tox_env  # type: ignore[attr-defined]
+
+    first = tox_project({"tox.ini": ""})
+    mocker.patch("tox.plugin.manager.load_inline", return_value=inline_plugin)
+    first_result = first.run("run", "-h")
+    first_result.assert_success()
+    assert "custom-runner" in first_result.out
+    assert "custom-runner" in REGISTER.env_runners
+    assert MANAGER.manager.is_registered(inline_plugin)
+    generation_with_plugin = MANAGER.generation
+
+    # config change: the next in-process run no longer has the inline plugin
+    second = tox_project({"tox.ini": ""})
+    mocker.patch("tox.plugin.manager.load_inline", return_value=None)
+    second_result = second.run("run", "-h")
+    second_result.assert_success()
+    assert "custom-runner" not in second_result.out
+    assert "custom-runner" not in REGISTER.env_runners
+    assert not MANAGER.manager.is_registered(inline_plugin)
+    assert list(REGISTER.env_runners) == ["virtualenv", "virtualenv-pep-723"]
+    assert MANAGER.generation == generation_with_plugin + 1

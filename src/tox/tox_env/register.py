@@ -24,6 +24,20 @@ class ToxEnvRegister:
     def _register_tox_env_types(self, manager: Plugin) -> None:
         manager.tox_register_tox_env(register=self)
 
+    def _adopt(self, other: ToxEnvRegister) -> None:
+        """Replace this registry's contents in place with those of another generation.
+
+        The swap is performed on the existing singleton (instead of rebinding the module
+        level object) so every importer keeps a valid reference while no entry from a
+        previous generation survives.
+
+        :param other: the freshly built registry to take over
+
+        """
+        self._run_envs = dict(other._run_envs)
+        self._package_envs = dict(other._package_envs)
+        self._default_run_env = other._default_run_env
+
     def add_run_env(self, of_type: type[RunToxEnv]) -> None:
         """Define a new run tox environment type.
 

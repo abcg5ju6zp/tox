@@ -3,10 +3,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
+import pluggy
 import pytest
 
 from tox import __version__
-from tox.plugin.manager import MANAGER
 
 if TYPE_CHECKING:
     from pytest_mock import MockFixture
@@ -36,7 +36,7 @@ def test_version_with_plugin(tox_project: ToxProjectCreator, mocker: MockFixture
             SimpleNamespace(project_name="A", version="2.0"),
         ),
     ]
-    mocker.patch.object(MANAGER.manager, "list_plugin_distinfo", return_value=dist)
+    mocker.patch.object(pluggy.PluginManager, "list_plugin_distinfo", return_value=dist)
 
     outcome = tox_project({"tox.ini": ""}).run("--version")
 
