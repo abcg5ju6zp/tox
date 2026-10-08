@@ -50,6 +50,8 @@ class Source(ABC):
         section = self.transform_section(section)
         loader: Loader[Any] | None = self.get_loader(section, override_map)
         if loader is not None:
+            loader.plan_role = type(self).__name__
+            loader.plan_source_path = self.path
             yield loader
 
         if base is not None:
@@ -65,6 +67,8 @@ class Source(ABC):
                 if loader is None:
                     loader = child
                     continue
+                loader.plan_role = type(self).__name__
+                loader.plan_source_path = self.path
                 if child is not None:
                     child.parent = loader
                 yield loader

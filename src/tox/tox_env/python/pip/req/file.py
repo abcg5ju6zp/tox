@@ -203,6 +203,7 @@ class RequirementsFile:
         self._requirements: list[ParsedRequirement] | None = None
         self._as_root_args: list[str] | None = None
         self._parser_private: ArgumentParser | None = None
+        self.plan_file_paths: list[Path] = []
 
     @property
     def _req_parser(self) -> RequirementsFile:
@@ -312,8 +313,10 @@ class RequirementsFile:
                 return self._read_decode(response)
         elif scheme == "file":
             url = url_to_path(url)
+        local_path = Path(url)
+        self.plan_file_paths.append(local_path.resolve())
         try:
-            with Path(url).open("rb") as file_handler:
+            with local_path.open("rb") as file_handler:
                 text = self._read_decode(file_handler)
         except OSError as exc:
             msg = f"Could not open requirements file {url}: {exc}"

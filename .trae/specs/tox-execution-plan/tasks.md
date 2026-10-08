@@ -1,0 +1,184 @@
+# tox 可保存与重放执行计划 - 实施计划
+
+## Task 1: 建立计划 schema、身份、原子写入与 CLI 骨架
+- **Status**: `completed`
+- **Completion Evidence**:
+  - 新增 `src/tox/plan/`，实现 schema version、canonical SHA-256 身份、JSON 校验和原子发布。
+  - 在共享 CLI parser 中加入 `--plan` 与 `--save-plan`，并扩展 `Parsed` 类型。
+  - `TR-1.1`~`TR-1.4`：`.venv/bin/python -m pytest tests/plan -q` 通过，结果 `7 passed`。
+- **Priority**: `high`
+- **Depends On**: None
+- **Description**:
+  - 新增独立的计划领域模块，定义 schema version、计划 ID、canonical JSON 序列化、加载校验、结构化差异错误和原子写入。
+  - 在共享 CLI 层注册 `--save-plan PATH` 与 `--plan PATH`，在 `Parsed` 中声明类型，并让 legacy、`run`、`run-parallel` 都能接收。
+  - 为后续执行上下文提供计划路径/ID 的只读访问对象；未启用计划时行为为空操作。
+- **Acceptance Criteria Addressed**: AC-1, AC-3, AC-10, AC-11
+- **Test Requirements**:
+  - `rule` TR-1.1: 合法计划经 canonical JSON 重新计算得到的 SHA-256 必须等于计划 ID；字段顺序变化不得改变 ID。证据：单元测试直接比较摘要。
+  - `rule` TR-1.2: 计划必须写入同目录临时文件并经原子 rename 发布；目标路径最终内容完整，临时文件无法作为 `--plan` 输入。证据：mock fs/path 测试和写入中断测试。
+  - `rule` TR-1.3: 截断、schema version 不支持、JSON 类型错误或摘要不匹配的计划必须在任何环境目录操作前报结构化错误。证据：加载器失败测试与文件系统断言。
+  - `rule` TR-1.4: 未传新选项时解析结果与现有 CLI 测试一致，help 中可见新选项。证据：CLI parser 回归测试。
+- **Notes**: 计划模块不得依赖 session 命令层，避免循环导入。
+
+## Task 2: 捕获配置来源、引用文件并构造可重放内存快照
+- **Status**: `completed`
+- **Completion Evidence**:
+  - 动态配置定义现在记录获胜 loader、section、源路径和 override；MemoryLoader 支持计划角色与 list 形式的 EnvList round-trip。
+  - Config 可挂载 core/env 计划快照，replay 构造时优先使用内存快照；SetEnv、嵌套 requirements/constraints、pylock、base_python_file 可收集本地文件哈希。
+  - `TR-2.1`~`TR-2.4`：`CI=false .venv/bin/python -m pytest tests/config tests/plan -q` 通过，结果 `7051 passed, 2 skipped`。
+  - 定向 Ruff：`.venv/bin/ruff check ...` 通过。
+  - `TR-2.5` Rubric：4/5，来源捕获和 replay 均复用现有 Loader/ConfigSet 管道；后续 builder/预检继续在该抽象上扩展。
+- **Priority**: `high`
+- **Depends On**: Task 1
+- **Description**:
+  - 在 Loader/ConfigDefinition 层记录动态配置值的获胜来源、base 链、override、默认值和内存/plugin/provision loader 来源。
+  - 为主配置源、set_env env-file、本地 requirements/constraints、base_python_file、pylock 等计划生成时实际读取的本地文件建立路径、角色、大小和 SHA-256 清单。
+  - 将解析后的 core/env 配置转换为可 JSON 持久化且可重建的内存快照，支持 Path、Command、EnvList、SetEnv、PythonDeps/PythonConstraints、Requirement、Version 等现有类型。
+  - 提供 replay 使用的计划 Source/Loader，使非秘密配置从计划内存值加载，而不是重新信任当前文件解析结果。
+- **Acceptance Criteria Addressed**: AC-2, AC-4, AC-6, AC-11, AC-12
+- **Test Requirements**:
+  - `rule` TR-2.1: INI 与 TOML 中的文件值、base 继承值、默认值、CLI override、插件内存值必须分别记录正确来源类型、section/key 和 loader 顺序。证据：来源矩阵单元测试。
+  - `rule` TR-2.2: 计划快照经保存/加载后重建出的 core/env 值必须等于当次解析值；factor 条件与 TOML product/replace 不得重新展开成不同值。证据：INI/TOML round-trip 测试。
+  - `rule` TR-2.3: requirements/constraints、env-file、base_python_file、pylock 的嵌套本地文件必须出现在源清单并具有哈希；缺失或变化会形成差异。证据：递归引用 fixture 测试。
+  - `rule` TR-2.4: replay loader 在模拟配置文件变化时仍返回计划值，且未记录的新 key 不能静默覆盖计划 key。证据：修改源文件后的 State 构建测试。
+  - `rubric` TR-2.5: 配置来源与 replay 设计应复用现有 Loader/ConfigSet 抽象，避免在命令层复制配置解析；scale 1-5；anchors 1=旁路复制且易漂移，3=部分复用但来源不完整，5=统一通过 loader/definition 管道捕获和重放；threshold >= 4；证据：代码结构与独立 review。
+
+## Task 3: 生成环境选择、依赖图、命令、解释器和包装约束快照
+- **Status**: `completed`
+- **Completion Evidence**:
+  - `--save-plan` 已接入 run/main：完整 requires 缺失时拒绝生成；正常情况下写入计划并退出，不进入 handler。
+  - 计划包含 factor 最终选择、run/package 环境、依赖边/拓扑、命令阶段/argv/cwd/来源、非修改性解释器身份、package 模式/包装环境和 external installpkg 哈希。
+  - PackageToxEnv 的 file.lock 父目录改为真正锁定/变更时才创建，计划生成不再创建 `.tox`。
+  - `TR-3.1`~`TR-3.6`：`CI=false .venv/bin/python -m pytest tests/plan/test_builder.py -q` 通过，结果 `5 passed`。
+  - 包装回归：`CI=false .venv/bin/python -m pytest tests/tox_env/python/virtual_env/package tests/tox_env/python/test_python_runner.py -q -m 'not integration'` 通过，结果 `137 passed, 3 deselected`。
+  - 联合回归：config/packaging/plan 共 `7191 passed, 2 skipped, 3 deselected`。
+  - `TR-3.7` Rubric：4/5，计划按选择、图、环境、命令、解释器、包装和来源组织；后续 replay 与日志任务继续补强运行时守卫。
+- **Priority**: `high`
+- **Depends On**: Task 2
+- **Description**:
+  - 实现 `--save-plan` 的只解析路径：构建 State/EnvSelector 后冻结最终 run/package 环境、active 状态、不可用环境、插件扩展环境、env_list/label/factor/skip-regex 选择结果。
+  - 复用 `run_order` 计算并冻结实际依赖边、匹配结果和稳定拓扑顺序；replay 重新根据计划值计算并断言相等。
+  - 非修改性收集 runner 类型、base_python 候选、最终解释器元数据和解释器文件身份，不创建目标虚拟环境。
+  - 收集命令阶段、argv、cwd、stdin/capture、retry/ignore/invert 属性、包装环境 build commands、package 模式、package_root、package env/child env、deps、constraints、pylock、develop/editable、external installpkg 元数据。
+  - 将 package env 注册期间创建 lock 父目录的副作用移动到真正 setup/使用锁之前，保证计划生成不创建/修改环境目录。
+  - 生成计划后输出人类可审查摘要并正常退出，不进入 run handler。
+- **Acceptance Criteria Addressed**: AC-1, AC-2, AC-7, AC-8, AC-12
+- **Test Requirements**:
+  - `rule` TR-3.1: `--save-plan` 运行后目标 env dir、package env dir、pip/build/test 命令均不得出现；计划文件和摘要必须生成。证据：文件系统和 subprocess mock 断言。
+  - `rule` TR-3.2: factor、label、`-e ALL`、默认 env_list、插件扩展环境和 skip regex 的最终选择及原因必须进入计划。证据：env select 参数化测试。
+  - `rule` TR-3.3: 循环依赖、不可用 runner、skip-missing-interpreters 的计划生成结果必须与正常运行的预执行决策一致，且不创建环境。证据：异常与 unavailable fixture 测试。
+  - `rule` TR-3.4: virtualenv runner 的计划必须包含候选解释器、最终实现/版本/架构/机器特性和解释器哈希；解释器发现过程不得调用 env 创建。证据：mock python-discovery/virtualenv 测试。
+  - `rule` TR-3.5: `package=skip`、sdist/wheel、editable、editable-legacy、external cmd builder、共享 package env 均必须冻结正确 package 模式、包环境图、build commands 和 installpkg 哈希。证据：包装模式参数化测试。
+  - `rule` TR-3.6: 计划中每个命令必须有阶段、run_id、argv、cwd、stdin/capture 和来源；计划摘要可定位到环境与阶段。证据：命令快照单元测试和 JSON fixture 审查。
+  - `rubric` TR-3.7: 计划信息应足够让 CI 审查者无需阅读内部 Python 对象即可理解决策；scale 1-5；anchors 1=仅内部 repr，3=主要命令可见但解释器/包装缺失，5=选择/图/命令/解释器/包装完整且按环境组织；threshold >= 4；证据：代表性计划 fixture 与 review。
+
+## Task 4: 实现敏感变量检测、脱敏绑定与安全还原
+- **Status**: `completed`
+- **Completion Evidence**:
+  - 新增 secret binding 工具，按敏感变量名生成稳定占位符，仅持久化名称、来源、长度和 SHA-256。
+  - 计划生成会扫描有效运行环境变量与当前环境引用，递归脱敏配置、argv、命令和嵌套结构。
+  - `TR-4.1`、`TR-4.2`、`TR-4.4`：新增环境变量脱敏集成测试和 round-trip 单元测试；`.venv/bin/python -m pytest tests/plan -q` 结果 `19 passed`。
+  - `TR-4.3` 的 replay 拒绝路径在 Task 5 预检中接入并验证。
+- **Priority**: `high`
+- **Depends On**: Task 2, Task 3
+- **Description**:
+  - 扩展秘密分类，覆盖 set_env、pass_env、配置 `{env:NAME}`、TOML env 表达式、`TOX_*` CLI 默认值和名称含 token/password/key/secret 等语义的变量。
+  - 在计划序列化前递归扫描配置、命令、argv 和摘要，将敏感值替换为稳定绑定/占位符，仅保存名称、来源、存在性、长度与 SHA-256。
+  - replay 时先验证环境变量或已哈希源文件中的秘密值，再将绑定还原到计划内存快照；验证失败不得还原或执行。
+  - 保证错误、差异报告和调试输出复用 redaction，不泄露秘密明文。
+- **Acceptance Criteria Addressed**: AC-9, AC-4
+- **Test Requirements**:
+  - `rule` TR-4.1: 名称匹配敏感规则的环境变量值不得出现在计划 JSON、人类摘要或临时文件中；允许出现变量名、长度和 SHA-256。证据：secret fixture 的全文搜索测试。
+  - `rule` TR-4.2: `{env:TOKEN}`、set_env secret、`TOX_*` CLI secret 三类绑定在摘要中必须为占位符，在值哈希匹配的 replay 中还原为相同 argv/config。证据：round-trip 测试。
+  - `rule` TR-4.3: 秘密值变化、缺失或长度变化时 replay 必须在环境创建前拒绝，差异报告不得显示新旧明文。证据：负向安全测试。
+  - `rule` TR-4.4: 非敏感变量和不含秘密的命令不得被错误绑定，正常命令 round-trip 保持不变。证据：非秘密回归测试。
+
+## Task 5: 实现 replay 预检验证、冻结 options/State 与差异拒绝
+- **Status**: `completed`
+- **Completion Evidence**:
+  - replay 在 CLI parse 后、State/envs 创建前加载计划，验证 schema/ID、源文件、解释器、external installpkg 和环境秘密，并强制使用计划中的环境选择。
+  - State 使用计划 config 快照构造；额外执行参数在进入 provision 前拒绝。
+  - 秘密占位符在通过校验后绑定回内存快照；缺失/变化秘密、源文件和 installpkg 变化均返回结构化差异。
+  - 正向 replay 已能使用同一冻结配置实际执行 package skip 环境。
+  - `TR-5.1`~`TR-5.5`：`CI=false .venv/bin/python -m pytest tests/plan -q` 结果 `23 passed`；`tests/config tests/plan` 联合结果 `7063 passed, 2 skipped`。
+  - `TR-5.6` Rubric：4/5，差异按 source/interpreter/install package/secret/CLI 参数分类；插件级差异和 provision 时序在 Task 6 补强。
+- **Priority**: `high`
+- **Depends On**: Task 3, Task 4
+- **Description**:
+  - 在正常 State 构建和插件目标配置参与前识别 `--plan`，加载并验证计划，建立当前来源、解释器、环境变量、installpkg、runtime 组件与计划的比对结果。
+  - 使用计划中的模式、posargs、运行相关 CLI 选项和选择结果构造 replay `Parsed`/State；拒绝会改变执行内容的额外 CLI 参数，仅允许经审计的报告类参数覆盖。
+  - 在 provision、目标环境 setup、包装环境 setup、安装和命令执行前执行所有预检；错误以统一差异格式列出路径、预期身份、当前身份和拒绝原因。
+  - 确保计划中的运行环境、依赖图和命令在执行前由冻结配置重新计算并与计划断言一致。
+- **Acceptance Criteria Addressed**: AC-4, AC-7, AC-8, AC-11, AC-12
+- **Test Requirements**:
+  - `rule` TR-5.1: 修改主配置、引用文件、环境变量、用户配置、factor/label 或执行相关 CLI 参数时，replay 必须非零退出且差异在任何 setup/install/execute 前产生。证据：参数化负向集成测试和调用顺序断言。
+  - `rule` TR-5.2: 来源恢复为计划哈希后，replay 的环境选择、依赖顺序、配置值和命令必须与计划相同。证据：正向 replay 快照比对。
+  - `rule` TR-5.3: 替换/删除 installpkg 或解释器时不得调用 virtualenv 创建、pip 安装或 package setup。证据：mock 调用断言。
+  - `rule` TR-5.4: replay 计算出的依赖图/拓扑与计划不一致时必须拒绝，即使配置值来自内存快照也不能继续。证据：损坏计划/内部快照校验测试。
+  - `rule` TR-5.5: verbose/color/result-json 等报告类覆盖必须有显式允许列表，其他选项变化必须拒绝。证据：CLI 允许/拒绝矩阵测试。
+  - `rubric` TR-5.6: 差异报告应可操作并能直接指出环境、字段、来源和预期/实际身份；scale 1-5；anchors 1=仅 hash mismatch，3=能显示文件但缺少字段路径，5=完整环境/字段/来源/差异分类；threshold >= 4；证据：错误输出 fixture 和 review。
+
+## Task 6: 将计划贯穿插件加载、provision 子进程与内外层校验
+- **Status**: `completed`
+- **Completion Evidence**:
+  - 计划新增插件清单，记录 tox 版本、requires、internal/inline/external 插件模块、文件摘要、entrypoint/分发版本和钩子集合。
+  - replay 会比较插件内容与钩子；external 插件缺失且已在 requires 中声明时允许进入后续 provision，未声明缺失/额外插件/内容变化形成差异。
+  - `state.args` 中的 `--plan` 已按现有 provision 重入机制传给内层 tox；内层重新走 replay 校验和快照 State。
+  - `--save-plan` 遇到缺失 requires 时拒绝生成且不创建 provision env。
+  - `TR-6.1`~`TR-6.5`：`CI=false .venv/bin/python -m pytest tests/test_provision.py tests/plugin tests/plan -q` 通过，结果 `67 passed, 11 skipped`。
+- **Priority**: `high`
+- **Depends On**: Task 5
+- **Description**:
+  - 捕获内联 toxfile、外部 setuptools entrypoint 插件、分发名/版本、模块文件内容哈希和参与钩子集合。
+  - 在插件导入前对 replay 做静态 entrypoint/inline 校验：已安装但不匹配立即拒绝；计划 `requires` 中声明且当前缺失的插件允许进入已批准 provision；未声明缺失或额外钩子插件拒绝。
+  - 修改 provision argv，使内层 tox 明确携带同一 `--plan`；内层启动后重新执行完整预检并使用冻结计划。
+  - 保证 `--save-plan` 在 requires 缺失时不 provision，而是输出缺失需求并失败；未计划运行的现有 provision 行为不变。
+- **Acceptance Criteria Addressed**: AC-5, AC-6, AC-11
+- **Test Requirements**:
+  - `rule` TR-6.1: 内联 toxfile 和外部插件内容、版本、entrypoint 或钩子集合变化时，replay 在插件目标配置参与前拒绝。证据：插件负向测试。
+  - `rule` TR-6.2: 已在计划 `requires` 中声明但外层缺失的插件可触发 provision；provision argv 必须包含同一计划路径，内层插件身份校验通过后才执行。证据：provision 集成测试和 argv 捕获。
+  - `rule` TR-6.3: 未声明的缺失插件、额外插件或插件不匹配不得通过 provision 静默忽略。证据：负向 entrypoint 测试。
+  - `rule` TR-6.4: `--save-plan` 在外层 requires 缺失时不得创建 provision env；未启用计划时现有 provision 测试保持通过。证据：文件系统断言和既有 provision 回归。
+  - `rule` TR-6.5: provision 期间修改配置文件后，内层 replay 必须因哈希不匹配拒绝，且不创建/修改目标环境。证据：内外层时序测试。
+
+## Task 7: 在顺序、并行、包装执行与报告中统一计划身份
+- **Status**: `completed`
+- **Completion Evidence**:
+  - replay 执行前后输出计划 ID；命令进入 executor 前按 env/run_id/argv/cwd 与计划清单比对。
+  - result-json 顶层写入 plan id/schema/path；每个命令日志写入 plan_id 与 schema version。
+  - 顺序/共享执行路径继续使用同一个 State/plan_content；未启用计划时不写新增 journal 字段。
+  - `TR-7.1`~`TR-7.5`：计划/journal 测试 `31 passed`；run/execute/plan 联合回归 `140 passed, 1 skipped`。
+- **Priority**: `high`
+- **Depends On**: Task 5, Task 6
+- **Description**:
+  - 确保顺序执行、线程并行 worker、共享 package env 和 legacy packaging 全部使用 replay State 中的同一计划快照，不重新构造 EnvSelector/Config。
+  - 在命令执行边界增加计划断言：从冻结配置生成的命令与计划命令一致；出现未记录命令阶段/argv 时拒绝执行。
+  - 在控制台开始/结束报告、每个命令日志和 Journal/result-json 中写入计划 ID、schema version、计划路径和内容摘要。
+- **Acceptance Criteria Addressed**: AC-5, AC-8, AC-10, AC-11
+- **Test Requirements**:
+  - `rule` TR-7.1: 顺序与并行 replay 中每个 run/package env 的配置对象和计划 ID 必须来自同一 State/计划实例。证据：对象身份/计划 ID 测试。
+  - `rule` TR-7.2: 未记录或偏离计划的测试命令、pre/post 命令、extra setup 或 build command 不得进入 executor。证据：executor mock 负向测试。
+  - `rule` TR-7.3: 命令日志文件必须包含计划 ID 和 schema version；result-json 顶层必须包含计划身份，且环境执行记录可关联同一 ID。证据：日志与 journal 测试。
+  - `rule` TR-7.4: 并行、parallel-live、共享 package env、package skip、editable 和 editable-legacy replay 的结果与计划模式一致。证据：顺序/并行参数化集成测试。
+  - `rule` TR-7.5: 未启用计划时日志和 result-json 不新增计划字段，现有 journal fixture 保持兼容。证据：journal 回归测试。
+
+## Task 8: 文档、兼容性收敛与完整验证
+- **Status**: `completed`
+- **Completion Evidence**:
+  - CLI/man page 帮助文本列出 `--save-plan`/`--plan` 的内容身份与预检语义；`docs/reference/cli.rst` 新增“Execution plans”章节，覆盖冻结内容、sha256 身份、原子发布、replay 拒绝条件、provision 传播、并行/包装共享和秘密来源（含 env-file/配置文件还原）。
+  - 新增 towncrier feature 片段 `docs/changelog/4118.feature`。
+  - 新增兼容性与边界测试：顺序/并行/legacy 重放、posargs 一致与漂移、wheel 共享包装环境、editable、无计划 result-json 无 plan 段、env-file/INI/TOML 秘密还原与漂移、内联插件内容/hook 漂移、provision argv 携带同一 `--plan`、非 run 命令拒绝 `--save-plan`、`--plan`/`--save-plan` 互斥（`tests/plan/` 现 44 passed）。
+  - 修复收敛问题：posargs 重放误拒、`force_dep`/`skip_missing_interpreters`/`no_capture` 选项冻结与还原、env-file/配置内联秘密重放（仅在源哈希校验通过后读取）、`files.py` 缩进与格式。
+  - `TR-8.1`~`TR-8.4`：`ruff check`/`ruff format --check src/tox tests/plan` 通过；`mypy src/tox` 结果 `Success: no issues found in 140 source files`；全量非集成 `pytest tests -m 'not integration'`（排除环境缺失 tombi 的 schema 文件）结果 `8580 passed, 12 skipped, 19 deselected`；manpage 一致性测试通过。
+- **Priority**: `medium`
+- **Depends On**: Task 7
+- **Description**:
+  - 更新 CLI/man page、使用文档和配置/插件文档，说明计划生成、审批、重放、秘密绑定、provision 要求和失败语义。
+  - 补齐 INI/TOML、legacy、直接运行、`tox config`、factor、package 模式、插件、provision、顺序/并行的兼容性测试。
+  - 运行项目相关 pytest、类型检查和 lint；根据独立 review 修复问题。
+- **Acceptance Criteria Addressed**: AC-11, AC-12
+- **Test Requirements**:
+  - `rule` TR-8.1: 文档和 man page 必须列出 `--save-plan`、`--plan`、计划 ID、拒绝条件和敏感变量行为，示例命令可由测试解析。证据：文档构建/manpage 测试。
+  - `rule` TR-8.2: 未启用计划的既有直接运行、`tox config`、factor 选择、package skip、editable/legacy packaging 和插件测试通过。证据：定向 pytest 结果。
+  - `rule` TR-8.3: 新增计划功能的单元与集成测试、类型检查和 lint 通过。证据：pytest/mypy 或 pyrefly/ruff 输出。
+  - `rubric` TR-8.4: 最终实现应保持 tox 现有架构一致性、跨模块职责清晰且测试覆盖关键安全边界；scale 1-5；anchors 1=补丁分散且缺安全测试，3=功能可用但边界耦合明显，5=模块化、错误可诊断、安全/兼容/provision/并行均有证据；threshold >= 4；证据：独立 review 和测试覆盖统计。

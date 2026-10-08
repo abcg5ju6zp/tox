@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from itertools import chain, tee
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from tox.config.main import Config
 from tox.journal import Journal
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
     from tox.config.cli.parse import Options
     from tox.config.cli.parser import ToxParser
+    from tox.util.json_types import JsonValue
 
 
 class State:
@@ -23,7 +24,16 @@ class State:
 
     def __init__(self, options: Options, args: Sequence[str]) -> None:
         (extended_envs,) = tee(chain.from_iterable(MANAGER.tox_extend_envs()), 1)
-        self.conf = Config.make(options.parsed, options.pos_args, options.source, extended_envs)
+        plan_snapshot = (
+            cast("dict[str, JsonValue]", options.parsed.plan_content["config"]) if options.parsed.plan_content else None
+        )
+        self.conf = Config.make(
+            options.parsed,
+            options.pos_args,
+            options.source,
+            extended_envs,
+            plan_snapshot=plan_snapshot,
+        )
         self.conf.core.add_constant(
             keys=["on_platform"],
             desc="platform we are running on",
@@ -31,7 +41,11 @@ class State:
         )
         self._options = options
         self.args = args
-        self._journal: Journal = Journal(options.parsed.result_json is not None)
+        self._journal: Journal = Journal(
+            options.parsed.result_json is not None,
+            plan_id=options.parsed.plan_id,
+            plan_path=str(options.parsed.plan) if options.parsed.plan is not None else None,
+        )
         self._selector: EnvSelector | None = None
 
     @property

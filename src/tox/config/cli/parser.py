@@ -175,6 +175,10 @@ class Parsed(Namespace):
     work_dir: Path | None
     root_dir: Path | None
     override: list[Override]
+    plan: Path | None
+    plan_id: str | None
+    plan_content: dict[str, Any] | None
+    save_plan: Path | None
     command: str
     remainder: list[str]
 
@@ -564,6 +568,27 @@ def add_core_arguments(parser: ArgumentParser) -> None:
         type=Path,
         of_type=Path | None,
         help="project root directory (if not specified will be the folder of the config file)",
+    )
+    parser.add_argument(
+        "--plan",
+        dest="plan",
+        metavar="path",
+        default=None,
+        type=Path,
+        of_type=Path | None,
+        help="replay a saved execution plan, verifying its content identity and sources, plugins, interpreter and "
+        "secret bindings before provisioning or creating environments",
+    )
+    parser.set_defaults(plan_id=None, plan_content=None)
+    parser.add_argument(
+        "--save-plan",
+        dest="save_plan",
+        metavar="path",
+        default=None,
+        type=Path,
+        of_type=Path | None,
+        help="save the resolved, content-addressed execution plan and exit without creating environments or "
+        "running commands",
     )
 
 

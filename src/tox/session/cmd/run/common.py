@@ -228,11 +228,18 @@ def _print_unused(is_colored: bool, section: str, unused: list[str]) -> None:  #
     print(f"{Fore.YELLOW if is_colored else ''}{msg}{Fore.RESET if is_colored else ''}")  # ruff:ignore[print]
 
 
+def _log_plan(state: State, phase: str) -> None:
+    plan_id = state.conf.options.plan_id
+    if plan_id is not None:
+        logging.warning("%s execution plan %s", phase, plan_id)
+
+
 def execute(state: State, max_workers: int | None, has_spinner: bool, live: bool) -> int:  # ruff:ignore[boolean-type-hint-positional-argument]
     interrupt, done = Event(), Event()
     results: list[ToxEnvRunResult] = []
     future_to_env: dict[Future[ToxEnvRunResult], ToxEnv] = {}
     state.envs.ensure_only_run_env_is_active()
+    _log_plan(state, "replaying")
     to_run_list: list[str] = list(state.envs.iter())
     for name in to_run_list:
         cast("RunToxEnv", state.envs[name]).mark_active()
@@ -287,6 +294,7 @@ def execute(state: State, max_workers: int | None, has_spinner: bool, live: bool
         ordered_results = _order_results(state, results, to_run_list)
         # write the journal
         write_journal(state.conf.options.result_json, state._journal)  # ruff:ignore[private-member-access]
+        _log_plan(state, "finished")
         # let editors discover an environment
         _record_venv_redirect(state)
         # warn about unused config keys

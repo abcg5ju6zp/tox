@@ -89,6 +89,10 @@ def provision(state: State) -> int | bool:
 
     requires = state.conf.core.get("requires", list[Requirement])
     missing = _get_missing(requires)
+    if missing and getattr(state.conf.options, "save_plan", None) is not None:
+        details = ", ".join(map(str, missing))
+        msg = f"cannot save a complete execution plan while provision requirements are missing: {details}"
+        raise HandledError(msg)
 
     deps = ", ".join(f"{p}{'' if v is None else f' ({v})'}" for p, v in missing)
     loader = MemoryLoader(  # these configuration values are loaded from in-memory always (no file conf)

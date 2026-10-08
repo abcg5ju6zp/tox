@@ -71,6 +71,7 @@ class SetEnv:
         self._override_keys: set[str] = set()
         self._expanding = False
         self._env_files: list[tuple[str, set[str]]] = []
+        self.plan_file_paths: list[Path] = []
         self._replacer: Replacer = lambda s, c, *, recursive=True: s  # ruff:ignore[unused-lambda-argument]
         self._name, self._env_name, self._root = name, env_name, root
         self._args = ConfigLoadArgs([], name, env_name)
@@ -323,6 +324,7 @@ class SetEnv:
         if not env_file.exists():
             msg = f"{env_file} does not exist for set_env"
             raise Fail(msg)
+        self.plan_file_paths.append(env_file.resolve())
         for env_line in env_file.read_text(encoding="utf-8").splitlines():
             env_line = env_line.strip()  # ruff:ignore[redefined-loop-name]
             if not env_line or env_line.startswith("#"):

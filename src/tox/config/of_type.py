@@ -108,6 +108,7 @@ class ConfigDynamicDefinition(ConfigDefinition[T]):  # ruff:ignore[eq-without-ha
         self.post_process = post_process
         self.factory = factory
         self._cache: object | T = _PLACE_HOLDER
+        self.plan_source: dict[str, object] | None = None
 
     @override
     def __call__(
@@ -118,6 +119,7 @@ class ConfigDynamicDefinition(ConfigDefinition[T]):  # ruff:ignore[eq-without-ha
     ) -> T:
         if self._cache is _PLACE_HOLDER:
             primary_key, *alias_keys = self.keys
+            selected_loader: Loader[T] | None = None
             for loader in loaders:
                 chain_key = f"{loader.section.key}.{primary_key}"
                 try:
@@ -132,6 +134,7 @@ class ConfigDynamicDefinition(ConfigDefinition[T]):  # ruff:ignore[eq-without-ha
                 except KeyError:
                     continue
                 else:
+                    selected_loader = loader
                     break
                 finally:
                     del args.chain[-1]
@@ -142,8 +145,25 @@ class ConfigDynamicDefinition(ConfigDefinition[T]):  # ruff:ignore[eq-without-ha
                     value = cast("T", self.default)  # when the default is None the overloads guarantee T includes None
             if self.post_process is not None:
                 value = self.post_process(value)
+            self.plan_source = self._plan_source(primary_key, selected_loader)
             self._cache = value
         return cast("T", self._cache)
+
+    @staticmethod
+    def _plan_source(primary_key: str, loader: Loader[T] | None) -> dict[str, object]:
+        if loader is None:
+            return {"type": "default", "key": primary_key}
+        overrides = [str(entry) for entry in loader.overrides.get(primary_key, [])]
+        source_path = getattr(loader, "plan_source_path", None)
+        return {
+            "type": "loader",
+            "key": primary_key,
+            "loader": type(loader).__name__,
+            "role": getattr(loader, "plan_role", type(loader).__name__),
+            "section": loader.section.key,
+            "path": None if source_path is None else str(source_path),
+            "overrides": overrides,
+        }
 
     @override
     def overwrite(self, value: T) -> None:

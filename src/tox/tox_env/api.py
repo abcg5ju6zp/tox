@@ -496,6 +496,10 @@ class ToxEnv(ABC):  # ruff:ignore[too-many-public-methods]
             cwd = cast("Path", self.core["tox_root"])
         if show is None:
             show = self.options.verbosity > 3  # ruff:ignore[magic-value-comparison]
+        if self.options.plan_content is not None:
+            from tox.plan.execution import assert_execution_in_plan  # ruff:ignore[import-outside-top-level]
+
+            assert_execution_in_plan(self.options.plan_content, self.conf.name, run_id, cmd, cwd)
         request = ExecuteRequest(cmd, cwd, self.environment_variables, stdin, run_id, allow=self._allow_externals)
         if request.cwd == _CWD:
             repr_cwd = ""
@@ -526,15 +530,30 @@ class ToxEnv(ABC):  # ruff:ignore[too-many-public-methods]
         if self._log_id == 0:  # start with fresh slate on new run
             ensure_empty_dir(self.env_log_dir)
         self._log_id += 1
-        self._write_execute_log(self.name, self.env_log_dir / f"{self._log_id}-{request.run_id}.log", request, status)
+        self._write_execute_log(
+            self.name,
+            self.env_log_dir / f"{self._log_id}-{request.run_id}.log",
+            request,
+            status,
+            self.options.plan_id,
+        )
 
     @staticmethod
-    def _write_execute_log(env_name: str, log_file: Path, request: ExecuteRequest, status: ExecuteStatus) -> None:
+    def _write_execute_log(
+        env_name: str,
+        log_file: Path,
+        request: ExecuteRequest,
+        status: ExecuteStatus,
+        plan_id: str | None,
+    ) -> None:
         if not log_file.parent.exists():
             log_file.parent.mkdir(parents=True, exist_ok=True)
         with log_file.open("wt", encoding="utf-8") as file:
             file.write(f"name: {env_name}\n")
             file.write(f"run_id: {request.run_id}\n")
+            if plan_id is not None:
+                file.write(f"plan_id: {plan_id}\n")
+                file.write("plan_schema_version: 1\n")
             msg = ""
             for env_key, env_value in sorted(request.env.items()):
                 redacted_value = redact_value(name=env_key, value=env_value)

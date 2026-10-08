@@ -17,7 +17,13 @@ if TYPE_CHECKING:
 class Journal:
     """The result of a tox session."""
 
-    def __init__(self, enabled: bool) -> None:  # ruff:ignore[boolean-type-hint-positional-argument]
+    def __init__(
+        self,
+        enabled: bool,  # ruff:ignore[boolean-type-hint-positional-argument]
+        *,
+        plan_id: str | None = None,
+        plan_path: str | None = None,
+    ) -> None:
         self._enabled = enabled
         self._content: dict[str, JsonValue] = {}
         self._env: dict[str, EnvJournal] = {}
@@ -31,6 +37,8 @@ class Journal:
                     "host": socket.getfqdn(),
                 },
             )
+            if plan_id is not None:
+                self._content["plan"] = {"id": plan_id, "schema_version": "1", "path": plan_path}
 
     def get_env_journal(self, name: str) -> EnvJournal:
         """Return the env log of an environment (create on first call)."""

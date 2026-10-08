@@ -14,6 +14,7 @@ from .convert import Convert, Factory
 from .str_convert import StrConvert
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from types import UnionType
     from typing import Final
 
@@ -117,12 +118,15 @@ class Loader(Convert[T]):
 
     """
 
+    plan_role = "loader"
+
     def __init__(self, section: Section, overrides: list[Override]) -> None:
         self._section = section
         self.overrides: dict[str, list[Override]] = {}
         for entry in overrides:
             self.overrides.setdefault(entry.key, []).append(entry)
         self.parent: Loader[Any] | None = None
+        self.plan_source_path: Path | None = None
 
     @property
     def section(self) -> Section:

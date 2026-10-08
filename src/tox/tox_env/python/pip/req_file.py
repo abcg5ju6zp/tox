@@ -49,6 +49,10 @@ class _PythonRequirementsFile(RequirementsFile):
             self._req_parser_ = RequirementsFile(path=self._path, constraint=self._CONSTRAINT)
         return self._req_parser_
 
+    @property
+    def plan_local_paths(self) -> list[Path]:
+        return list(self._req_parser.plan_file_paths)
+
     @override
     def _get_file_content(self, url: str) -> str:
         return self._raw  # only the file itself is read here, nested files go through the plain parser

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from tox.session.state import State
+    from tox.util.json_types import JsonValue
 
 
 class Options(NamedTuple):
@@ -38,7 +39,7 @@ def get_options(*args: str) -> Options:
         args = args[:pos_arg_at]
 
     guess_verbosity, log_handler, source = _get_base(args)
-    parsed, cmd_handlers = _get_all(args)
+    parsed, cmd_handlers = _get_all(args, pos_args)
     if guess_verbosity != parsed.verbosity:
         log_handler.update_verbosity(parsed.verbosity)
     return Options(parsed, pos_args, source, cmd_handlers, log_handler)
@@ -80,7 +81,9 @@ def _empty_source() -> Source:
     return ToxIni(Path.cwd() / "tox.ini", content="")
 
 
-def _get_all(args: Sequence[str]) -> tuple[Parsed, dict[str, Callable[[State], int]]]:
+def _get_all(
+    args: Sequence[str], pos_args: Sequence[str] | None = None
+) -> tuple[Parsed, dict[str, Callable[[State], int]]]:
     """Parse all the options."""
     tox_parser = _get_parser()
     try:
@@ -93,8 +96,46 @@ def _get_all(args: Sequence[str]) -> tuple[Parsed, dict[str, Callable[[State], i
     parsed.remainder = unknown
     if getattr(parsed, "no_capture", False) and getattr(parsed, "result_json", None):
         tox_parser.error("argument -i/--no-capture: not allowed with argument --result-json")
+    if parsed.plan is not None and getattr(parsed, "save_plan", None) is not None:
+        tox_parser.error("argument --plan: not allowed with argument --save-plan")
+    if parsed.plan is not None:
+        _apply_plan_replay(parsed, args, pos_args)
     handlers = {k: p for k, (_, p) in tox_parser.handlers.items()}
     return parsed, handlers
+
+
+def _apply_plan_replay(parsed: Parsed, args: Sequence[str], pos_args: Sequence[str] | None) -> None:
+    from tox.plan.replay import load_and_verify_replay, replay_selection  # ruff:ignore[import-outside-top-level]
+    from tox.session.env_select import CliEnv  # ruff:ignore[import-outside-top-level]
+
+    try:
+        plan, plan_id = load_and_verify_replay(parsed, list(args), list(pos_args or ()))
+    except (TypeError, ValueError) as exc:
+        raise HandledError(str(exc)) from exc
+    parsed.plan_content = plan
+    parsed.plan_id = plan_id
+    parsed.env = CliEnv(replay_selection(plan))
+    parsed.labels = []
+    parsed.factors = []
+    parsed.skip_env = ""
+    _apply_plan_options(parsed, plan)
+
+
+def _apply_plan_options(parsed: Parsed, plan: dict[str, JsonValue]) -> None:
+    options = plan.get("options")
+    if isinstance(options, dict):
+        for key, value in options.items():
+            if key == "discover" and isinstance(value, list):
+                setattr(parsed, key, [Path(str(item)) for item in value])
+            elif key == "force_dep" and isinstance(value, list):
+                from packaging.requirements import Requirement  # ruff:ignore[import-outside-top-level]
+
+                setattr(parsed, key, [Requirement(str(item)) for item in value])
+            else:
+                setattr(parsed, key, value)
+    installpkg = plan.get("installpkg")
+    if isinstance(installpkg, dict):
+        parsed.install_pkg = Path(str(installpkg["path"]))
 
 
 def _get_parser() -> ToxParser:

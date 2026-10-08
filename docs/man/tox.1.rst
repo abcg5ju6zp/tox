@@ -94,6 +94,13 @@ OPTIONS
 **--root** *dir*
     project root directory (if not specified will be the folder of the config file)
 
+**--plan** *path*
+    replay a saved execution plan, verifying its content identity and sources, plugins, interpreter and secret
+    bindings before provisioning or creating environments
+
+**--save-plan** *path*
+    save the resolved, content-addressed execution plan and exit without creating environments or running commands
+
 **--runner**
     the tox run engine to use when not explicitly stated in tox env configuration
 

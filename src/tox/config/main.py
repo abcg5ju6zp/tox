@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
     from tox.config.loader.api import Loader, OverrideMap
     from tox.config.loader.toml._product import FactorGroup
+    from tox.util.json_types import JsonValue
 
     from .cli.parser import Parsed
     from .loader.memory import MemoryLoader
@@ -37,6 +38,7 @@ class Config:
         pos_args: Sequence[str] | None,
         work_dir: Path,
         extra_envs: Iterable[str],
+        plan_snapshot: dict[str, JsonValue] | None = None,
     ) -> None:
         self._pos_args = None if pos_args is None else tuple(pos_args)
         self._work_dir = work_dir
@@ -53,6 +55,9 @@ class Config:
         self._env_to_conf_set: dict[str, EnvConfigSet] = {}
         self._core_set: CoreConfigSet | None = None
         self.memory_seed_loaders: defaultdict[str, list[MemoryLoader]] = defaultdict(list)
+        self.plan_core_snapshot = cast("dict[str, JsonValue] | None", plan_snapshot.get("core") if plan_snapshot else None)
+        env_snapshots = plan_snapshot.get("envs", {}) if plan_snapshot else {}
+        self.plan_env_snapshots = cast("dict[str, JsonValue]", env_snapshots)
 
     def pos_args(self, to_path: Path | None) -> tuple[str, ...] | None:
         """:param to_path: if not None rewrite relative posargs paths from cwd to to_path
@@ -115,7 +120,14 @@ class Config:
         return any(name == item for name in self)
 
     @classmethod
-    def make(cls, parsed: Parsed, pos_args: Sequence[str] | None, source: Source, extra_envs: Iterable[str]) -> Config:
+    def make(
+        cls,
+        parsed: Parsed,
+        pos_args: Sequence[str] | None,
+        source: Source,
+        extra_envs: Iterable[str],
+        plan_snapshot: dict[str, JsonValue] | None = None,
+    ) -> Config:
         """Make a tox configuration object."""
         # root is the project root, where the configuration file is at
         # work dir is where we put our own files
@@ -131,6 +143,7 @@ class Config:
             root=root,
             work_dir=work_dir,
             extra_envs=extra_envs,
+            plan_snapshot=plan_snapshot,
         )
 
     @property
@@ -154,6 +167,10 @@ class Config:
         core_section = self._src.get_core_section()
         core = CoreConfigSet(self, core_section, self._root, self.src_path)
         core.loaders.extend(self._src.get_loaders(core_section, base=[], override_map=self._overrides, conf=core))
+        if self.plan_core_snapshot is not None:
+            from tox.plan.snapshot import memory_loader  # ruff:ignore[import-outside-top-level]
+
+            core.loaders.insert(0, memory_loader(self.plan_core_snapshot, role="execution-plan-core"))
         self._core_set = core
         return core
 
@@ -177,6 +194,11 @@ class Config:
                 conf_set.loaders.append(loader)
             if loaders is not None:
                 conf_set.loaders.extend(loaders)
+            env_snapshot = self.plan_env_snapshots.get(for_env) if for_env is not None else None
+            if isinstance(env_snapshot, dict):
+                from tox.plan.snapshot import memory_loader  # ruff:ignore[import-outside-top-level]
+
+                conf_set.loaders.insert(0, memory_loader(env_snapshot, role="execution-plan-env"))
             return conf_set
 
     def get_env(

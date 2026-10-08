@@ -40,13 +40,25 @@ def run(args: Sequence[str] | None = None) -> None:
 
 def main(args: Sequence[str]) -> int:
     state = setup_state(args)
+    if state.conf.options.save_plan is not None and state.conf.options.command not in _PLAN_COMMANDS:
+        msg = "--save-plan can only be used with the run, run-parallel and legacy commands"
+        raise HandledError(msg)
     from tox.provision import provision  # ruff:ignore[import-outside-top-level]
 
     result = provision(state)
     if result is not False:
         return result
+    if state.conf.options.save_plan is not None:
+        from tox.plan import build_plan, save_plan  # ruff:ignore[import-outside-top-level]
+
+        identity = save_plan(state.conf.options.save_plan, build_plan(state))
+        logging.warning("saved execution plan %s with identity %s", state.conf.options.save_plan, identity)
+        return 0
     handler = state._options.cmd_handlers[state.conf.options.command]  # ruff:ignore[private-member-access]
     return handler(state)
+
+
+_PLAN_COMMANDS = {"run", "r", "run-parallel", "p", "legacy"}
 
 
 def setup_state(args: Sequence[str]) -> State:
