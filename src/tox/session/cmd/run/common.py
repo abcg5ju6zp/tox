@@ -23,6 +23,7 @@ from tox.execute import Outcome
 from tox.journal import write_journal
 from tox.report import HandledError
 from tox.session.cmd.run.single import ToxEnvRunResult, run_one
+from tox.session.status import SESSION_STATE_FILE, EnvRecord, EnvStatus, SessionStatus
 from tox.tox_env.errors import Fail
 from tox.util.graph import stable_topological_sort
 from tox.util.spinner import MISS_DURATION, Spinner
@@ -30,7 +31,7 @@ from tox.util.typing_compat import override
 from tox.util.venv_redirect import record_venv_redirect, venv_redirect_path
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Sequence
     from types import FrameType
 
     from tox.session.state import State
@@ -126,6 +127,14 @@ def env_run_create_flags(
             default=False,
             dest="fail_fast",
             help="stop execution after the first environment failure",
+        )
+        parser.add_argument(
+            "--no-resume",
+            action="store_false",
+            default=True,
+            dest="resume",
+            help="do not reuse environments already confirmed successful in an earlier interrupted session; run all"
+            " selected environments again",
         )
     if mode not in {"devenv", "depends"}:
         parser.add_argument(
@@ -228,7 +237,12 @@ def _print_unused(is_colored: bool, section: str, unused: list[str]) -> None:  #
     print(f"{Fore.YELLOW if is_colored else ''}{msg}{Fore.RESET if is_colored else ''}")  # ruff:ignore[print]
 
 
-def execute(state: State, max_workers: int | None, has_spinner: bool, live: bool) -> int:  # ruff:ignore[boolean-type-hint-positional-argument]
+def execute(  # ruff:ignore[complex-structure]
+    state: State,
+    max_workers: int | None,
+    has_spinner: bool,  # ruff:ignore[boolean-type-hint-positional-argument]
+    live: bool,  # ruff:ignore[boolean-type-hint-positional-argument]
+) -> int:
     interrupt, done = Event(), Event()
     results: list[ToxEnvRunResult] = []
     future_to_env: dict[Future[ToxEnvRunResult], ToxEnv] = {}
@@ -238,16 +252,28 @@ def execute(state: State, max_workers: int | None, has_spinner: bool, live: bool
         cast("RunToxEnv", state.envs[name]).mark_active()
     _venv_redirect_enabled(state, _env_dirs(state))  # reject a conflicting setting before any environment runs
 
+    # environments a previous, interrupted session already confirmed are not run again unless asked to
+    resume = bool(getattr(state.conf.options, "resume", True))
+    status_path = state.conf.core.get("work_dir", Path) / SESSION_STATE_FILE
+    session_status = SessionStatus.open(status_path, resume=resume)
+    reused = session_status.reusable(to_run_list)
+    for name, record in reused.items():
+        logger.info("reusing result of environment %s from the previous session", name)
+        results.append(_reused_result(name, record))
+    pending = [name for name in to_run_list if name not in reused]
+    session_status.begin(pending, reused=reused)
+
     scheduler_error: list[BaseException] = []
 
     def _run_thread() -> tuple[Callable[[int, FrameType | None], Any] | int | Handlers | None, bool]:
-        spinner = ToxSpinner(has_spinner, state, len(to_run_list))
+        spinner = ToxSpinner(has_spinner, state, len(pending))
         thread = Thread(
             target=_queue_and_wait,
             name="tox-interrupt",
             args=(
                 state,
                 to_run_list,
+                pending,
                 results,
                 future_to_env,
                 interrupt,
@@ -256,6 +282,7 @@ def execute(state: State, max_workers: int | None, has_spinner: bool, live: bool
                 spinner,
                 live,
                 scheduler_error,
+                session_status,
             ),
         )
         thread.start()
@@ -285,6 +312,9 @@ def execute(state: State, max_workers: int | None, has_spinner: bool, live: bool
             raise scheduler_error[0]
     finally:
         ordered_results = _order_results(state, results, to_run_list)
+        # a finished session has nothing to resume; an interrupted one stays on disk unless the user opted out
+        if not has_previous or not resume:
+            session_status.discard()
         # write the journal
         write_journal(state.conf.options.result_json, state._journal)  # ruff:ignore[private-member-access]
         # let editors discover an environment
@@ -303,6 +333,17 @@ def execute(state: State, max_workers: int | None, has_spinner: bool, live: bool
         if has_previous:
             signal(SIGINT, previous)
     return exit_code
+
+
+def _reused_result(name: str, record: EnvRecord) -> ToxEnvRunResult:
+    return ToxEnvRunResult(
+        name=name,
+        skipped=record.skipped,
+        code=record.exit_code if record.exit_code is not None else Outcome.OK,
+        outcomes=[],
+        duration=record.duration if record.duration is not None else MISS_DURATION,
+        ignore_outcome=record.ignore_outcome,
+    )
 
 
 def _env_dirs(state: State) -> dict[str, Path]:
@@ -392,6 +433,7 @@ def _next_completed(
 def _queue_and_wait(  # ruff:ignore[too-many-arguments]
     state: State,
     to_run_list: list[str],
+    pending: list[str],
     results: list[ToxEnvRunResult],
     future_to_env: dict[Future[ToxEnvRunResult], ToxEnv],
     interrupt: Event,
@@ -400,10 +442,21 @@ def _queue_and_wait(  # ruff:ignore[too-many-arguments]
     spinner: ToxSpinner,
     live: bool,  # ruff:ignore[boolean-type-hint-positional-argument]
     error: list[BaseException],
+    session_status: SessionStatus,
 ) -> None:
     try:
         try:
-            _do_queue_and_wait(state, to_run_list, results, future_to_env, interrupt, max_workers, spinner, live)
+            _do_queue_and_wait(
+                state,
+                pending,
+                results,
+                future_to_env,
+                interrupt,
+                max_workers,
+                spinner,
+                live,
+                session_status,
+            )
         except BaseException as exception:  # ruff:ignore[blind-except] # re-raised in the main thread
             error.append(exception)
     finally:
@@ -421,23 +474,29 @@ def _tear_down(tox_env: ToxEnv) -> None:
         logger.warning("failed to tear down environment %s", tox_env.conf.name, exc_info=True)
 
 
-def _do_queue_and_wait(  # ruff:ignore[complex-structure, too-many-arguments, too-many-statements, too-many-branches]
+def _do_queue_and_wait(  # ruff:ignore[complex-structure, too-many-arguments, too-many-branches]
     state: State,
-    to_run_list: list[str],
+    pending: list[str],
     results: list[ToxEnvRunResult],
     future_to_env: dict[Future[ToxEnvRunResult], ToxEnv],
     interrupt: Event,
     max_workers: int | None,
     spinner: ToxSpinner,
     live: bool,  # ruff:ignore[boolean-type-hint-positional-argument]
+    session_status: SessionStatus,
 ) -> None:
     options = state._options  # ruff:ignore[private-member-access]
     with spinner:  # ruff:ignore[too-many-nested-blocks]
         # an unbounded pool (-p all) sizes to the selection; keep at least one worker so an empty
         # selection does not raise ValueError from ThreadPoolExecutor
-        max_workers = max(1, len(to_run_list)) if max_workers is None else max_workers
-        completed: set[str] = set()
-        envs_to_run_generator = ready_to_run_envs(state, to_run_list, completed)
+        max_workers = max(1, len(pending)) if max_workers is None else max_workers
+        order, todo = run_order(state, pending)
+        remaining: set[str] = set(pending)
+        stop_scheduling = False
+        fail_fast_enabled = options.parsed.fail_fast or any(
+            cast("RunToxEnv", state.envs[env]).conf["fail_fast"] for env in pending
+        )
+        signalled: set[Future[ToxEnvRunResult]] = set()
 
         def _run(tox_env: RunToxEnv) -> ToxEnvRunResult:
             spinner.add(tox_env.conf.name)
@@ -447,78 +506,183 @@ def _do_queue_and_wait(  # ruff:ignore[complex-structure, too-many-arguments, to
                 suspend_display=live is False,
             )
 
-        env_list: list[str] = []
-        stop_scheduling = False
-        fail_fast_enabled = options.parsed.fail_fast or any(
-            cast("RunToxEnv", state.envs[env]).conf["fail_fast"] for env in to_run_list
-        )
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="tox-driver") as executor:
             while True:
-                envs_to_queue = (
-                    env_list[:1] if max_workers == 1 and fail_fast_enabled and not interrupt.is_set() else env_list
-                )
-                for env in envs_to_queue:  # queue all available (or one at a time if sequential + fail-fast)
-                    tox_env_to_run = cast("RunToxEnv", state.envs[env])
-                    if interrupt.is_set():  # queue the rest as failed upfront
-                        tox_env_to_run.teardown()
-                        future: Future[ToxEnvRunResult] = Future()
-                        res = ToxEnvRunResult(name=env, skipped=False, code=-2, outcomes=[], duration=MISS_DURATION)
-                        future.set_result(res)
-                    else:
-                        future = executor.submit(_run, tox_env_to_run)
-                    future_to_env[future] = tox_env_to_run
-                env_list = env_list[len(envs_to_queue) :]
+                # a user interrupt cancels every environment that has not started running yet
+                if interrupt.is_set():
+                    _cancel_queued_envs(
+                        session_status,
+                        order,
+                        remaining,
+                        results,
+                        state,
+                        spinner,
+                        live,
+                        exit_code=-2,
+                        skipped=False,
+                        reason="interrupted",
+                        tear_down=True,
+                    )
+                # a failed or cancelled dependency deterministically cancels every successor (transitively)
+                for name, reason in session_status.propagate(todo):
+                    _record_cancelled(
+                        name, -2, skipped=True, reason=reason, results=results, state=state, spinner=spinner, live=live
+                    )
+                    remaining.discard(name)
+                # fail fast keeps already running environments going but never starts a new one
+                if stop_scheduling:
+                    _cancel_queued_envs(
+                        session_status,
+                        order,
+                        remaining,
+                        results,
+                        state,
+                        spinner,
+                        live,
+                        exit_code=-2,
+                        skipped=True,
+                        reason="fail fast",
+                        tear_down=False,
+                    )
 
-                if not future_to_env:
-                    result: ToxEnvRunResult | None = None
-                else:
+                ready = ready_to_run(session_status, order, todo, remaining)
+                if interrupt.is_set() or stop_scheduling:
+                    ready = []
+                elif max_workers == 1 and fail_fast_enabled:
+                    # sequential fail-fast runs one environment at a time so it can stop before queuing the rest
+                    ready = ready[:1]
+                for env in ready:
+                    tox_env_to_run = cast("RunToxEnv", state.envs[env])
+                    future = executor.submit(_run, tox_env_to_run)
+                    session_status.mark_running(env)
+                    future_to_env[future] = tox_env_to_run
+
+                result: ToxEnvRunResult | None = None
+                if future_to_env:
                     completed_future = _next_completed(future_to_env, interrupt)
                     if completed_future is None:
-                        for pending_future, pending_env in list(future_to_env.items()):
-                            if not pending_future.cancel() and not pending_future.done():
-                                pending_env.interrupt()
-                        future_to_env.clear()
-                        env_list = []
-                        result = None
+                        # interrupt: stop futures the executor has not started, signal the rest, then keep
+                        # waiting so every in-flight environment reaches a terminal state instead of hanging
+                        _signal_in_flight(future_to_env, signalled)
                     else:
-                        tox_env_done = future_to_env.pop(completed_future)
-                        try:
-                            result = completed_future.result()
-                        except CancelledError:
-                            tox_env_done.teardown()
-                            was_interrupted = interrupt.is_set()
-                            result = ToxEnvRunResult(
-                                name=tox_env_done.conf.name,
-                                skipped=not was_interrupted,
-                                code=-3 if was_interrupted else -2,
-                                outcomes=[],
-                                duration=MISS_DURATION,
-                            )
-                        results.append(result)
-                        completed.add(result.name)
-                        if (
-                            result.code != Outcome.OK
-                            and not result.skipped
-                            and not result.ignore_outcome
-                            and (options.parsed.fail_fast or result.fail_fast)
-                        ):
-                            # stop scheduling new work but let running environments finish: only a user interrupt
-                            # abandons them (cancel only stops futures the executor has not started yet)
+                        signalled.discard(completed_future)
+                        result, failed_fast = _consume_completed_future(
+                            future_to_env,
+                            completed_future,
+                            interrupt,
+                            options.parsed.fail_fast,
+                            session_status,
+                        )
+                        if failed_fast:
                             stop_scheduling = True
-                            env_list = []
-                            for pending_future in list(future_to_env.keys()):
-                                pending_future.cancel()
+                        results.append(result)
+                        remaining.discard(result.name)
 
-                if not interrupt.is_set() and not stop_scheduling and not env_list:
-                    env_list = next(envs_to_run_generator, [])
-                # if nothing running and nothing more to run we're done
-                final_run = not env_list and not future_to_env
+                final_run = not remaining and not future_to_env
                 if final_run:  # disable report on final env
                     spinner.print_report = False
                 if result is not None:
                     _handle_one_run_done(result, spinner, state, live)
                 if final_run:
                     break
+
+
+def _signal_in_flight(
+    future_to_env: dict[Future[ToxEnvRunResult], ToxEnv], signalled: set[Future[ToxEnvRunResult]]
+) -> None:
+    """Cancel futures not yet started and interrupt the rest, each at most once."""
+    for waiting_future, waiting_env in list(future_to_env.items()):
+        if waiting_future in signalled:
+            continue
+        if not waiting_future.cancel() and not waiting_future.done():
+            waiting_env.interrupt()
+        signalled.add(waiting_future)
+
+
+def _consume_completed_future(
+    future_to_env: dict[Future[ToxEnvRunResult], ToxEnv],
+    completed_future: Future[ToxEnvRunResult],
+    interrupt: Event,
+    cli_fail_fast: bool,  # ruff:ignore[boolean-type-hint-positional-argument]
+    session_status: SessionStatus,
+) -> tuple[ToxEnvRunResult, bool]:
+    """Turn a completed future into its run result, updating the session state.
+
+    :returns: the run result and a flag indicating a fail-fast triggering failure
+
+    """
+    tox_env_done = future_to_env.pop(completed_future)
+    try:
+        result = completed_future.result()
+    except CancelledError:
+        tox_env_done.teardown()
+        was_interrupted = interrupt.is_set()
+        result = ToxEnvRunResult(
+            name=tox_env_done.conf.name,
+            skipped=not was_interrupted,
+            code=-3 if was_interrupted else -2,
+            outcomes=[],
+            duration=MISS_DURATION,
+        )
+        session_status.cancel(
+            result.name,
+            exit_code=result.code,
+            skipped=result.skipped,
+            reason="interrupted" if was_interrupted else "fail fast",
+        )
+        return result, False
+    status = session_status.finish(
+        result.name,
+        exit_code=result.code,
+        skipped=result.skipped,
+        ignore_outcome=result.ignore_outcome,
+        duration=result.duration,
+        interrupted=interrupt.is_set(),
+    )
+    failed_fast = status is EnvStatus.FAILED and (cli_fail_fast or result.fail_fast)
+    if failed_fast:
+        # do not schedule new work; running environments are allowed to finish (cancel only stops futures the
+        # executor has not started yet)
+        for waiting_future in list(future_to_env.keys()):
+            waiting_future.cancel()
+    return result, failed_fast
+
+
+def _cancel_queued_envs(  # ruff:ignore[too-many-arguments]
+    session_status: SessionStatus,
+    order: list[str],
+    remaining: set[str],
+    results: list[ToxEnvRunResult],
+    state: State,
+    spinner: ToxSpinner,
+    live: bool,  # ruff:ignore[boolean-type-hint-positional-argument]
+    *,
+    exit_code: int,
+    skipped: bool,
+    reason: str,
+    tear_down: bool,
+) -> None:
+    for name in session_status.cancel_queued(order, exit_code=exit_code, skipped=skipped, reason=reason):
+        if tear_down:  # the environment never runs, so its normal run-time teardown does not happen either
+            _tear_down(cast("RunToxEnv", state.envs[name]))
+        _record_cancelled(name, exit_code, skipped, reason, results, state, spinner, live)
+        remaining.discard(name)
+
+
+def _record_cancelled(  # ruff:ignore[too-many-arguments]
+    name: str,
+    code: int,
+    skipped: bool,  # ruff:ignore[boolean-type-hint-positional-argument]
+    reason: str,
+    results: list[ToxEnvRunResult],
+    state: State,
+    spinner: ToxSpinner,
+    live: bool,  # ruff:ignore[boolean-type-hint-positional-argument]
+) -> None:
+    logger.warning("%s: cancelled (%s)", name, reason)
+    result = ToxEnvRunResult(name=name, skipped=skipped, code=code, outcomes=[], duration=MISS_DURATION)
+    results.append(result)
+    _handle_one_run_done(result, spinner, state, live)
 
 
 def _handle_one_run_done(
@@ -551,19 +715,15 @@ def _handle_one_run_done(
                 state._options.log_handler.write_out_err(out_err)  # ruff:ignore[private-member-access]
 
 
-def ready_to_run_envs(state: State, to_run: list[str], completed: set[str]) -> Iterator[list[str]]:
-    """Generate tox environments ready to run."""
-    order, todo = run_order(state, to_run)
-    while order:
-        ready_to_run: list[str] = []
-        new_order: list[str] = []
-        for env in order:  # collect next batch of ready to run
-            if todo[env] - completed:
-                new_order.append(env)
-            else:
-                ready_to_run.append(env)
-        order = new_order
-        yield ready_to_run
+def ready_to_run(status: SessionStatus, order: list[str], todo: dict[str, set[str]], remaining: set[str]) -> list[str]:
+    """Collect queued environments whose dependencies all succeeded, in stable execution order."""
+    return [
+        name
+        for name in order
+        if name in remaining
+        and status.status_of(name) is EnvStatus.QUEUED
+        and all(status.status_of(dep) is EnvStatus.SUCCESS for dep in todo[name])
+    ]
 
 
 def run_order(state: State, to_run: list[str]) -> tuple[list[str], dict[str, set[str]]]:

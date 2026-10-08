@@ -919,3 +919,68 @@ def test_result_json_marks_skipped(tox_project: ToxProjectCreator) -> None:
     outcome.assert_success()
     result = json.loads((project.path / "out.json").read_text())["testenvs"]["a"]["result"]
     assert result == {"success": True, "exit_code": 0, "duration": result["duration"], "skipped": True}
+
+
+def test_sequential_dependency_failure_cancels_successors(tox_project: ToxProjectCreator) -> None:
+    """Without fail fast, independent environments still run, but successors of a failure never start."""
+    toml = dedent("""\
+        env_list = ["a", "b", "c"]
+        [env_run_base]
+        package = "skip"
+        [env.a]
+        commands = [["python", "-c", "raise SystemExit(7)"]]
+        [env.b]
+        depends = ["a"]
+        commands = [["python", "-c", "print('successor ran')"]]
+        [env.c]
+        commands = [["python", "-c", "print('independent ran')"]]
+    """)
+    project = tox_project({"tox.toml": toml})
+
+    outcome = project.run("r")
+
+    outcome.assert_failed()
+    assert "successor ran" not in outcome.out
+    assert "independent ran" in outcome.out
+    assert "a: FAIL code 7" in outcome.out
+    assert "  b: SKIP " in outcome.out
+    assert "  c: OK " in outcome.out
+    assert "b: cancelled (dependency a failed)" in outcome.out, outcome.out
+
+
+def test_sequential_reused_environment_is_not_recreated(tox_project: ToxProjectCreator) -> None:
+    """A successful environment carried over from an interrupted session is reported without running again."""
+    toml = dedent("""\
+        env_list = ["a", "b"]
+        [env_run_base]
+        package = "skip"
+        [env.a]
+        commands = [["python", "-c", "print('a ran')"]]
+        [env.b]
+        depends = ["a"]
+        commands = [["python", "-c", "print('b ran')"]]
+    """)
+    project = tox_project({"tox.toml": toml})
+    state_file = project.path / ".tox" / "session.json"
+    state_file.parent.mkdir(parents=True)
+    state_file.write_text(
+        json.dumps({
+            "version": 1,
+            "toxversion": __version__,
+            "envs": {
+                "a": {"status": "success", "exit_code": 0, "skipped": False, "ignore_outcome": False,
+                      "duration": 0.42, "reason": None},
+                "b": {"status": "running", "exit_code": None, "skipped": False, "ignore_outcome": False,
+                      "duration": None, "reason": None},
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    outcome = project.run("r")
+
+    outcome.assert_success()
+    assert "a ran" not in outcome.out  # reused from the previous session
+    assert "b ran" in outcome.out
+    assert "  a: OK (0.42 seconds)" in outcome.out
+    assert not state_file.exists()

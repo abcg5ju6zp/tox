@@ -397,8 +397,11 @@ After provisioning, the handler is dispatched (see :ref:`exec-entry-points` for 
     handler = state._options.cmd_handlers[state.conf.options.command]
     return handler(state)
 
-Run execution uses ``ready_to_run_envs()`` for topological batch scheduling — environments whose ``depends`` are all
-satisfied are yielded first.
+Run execution tracks every selected environment through the session states ``queued``, ``running``, ``success``,
+``failed`` and ``cancelled`` (see :class:`~tox.session.status.SessionStatus`). Environments whose ``depends`` all
+succeeded are scheduled first; a failed or cancelled dependency deterministically cancels its successors. The state
+is persisted under the work directory, so a session interrupted by a cancellation, a lost terminal or a crash reuses
+the environments it already confirmed on the next invocation instead of running them again.
 
 .. _exec-environment-lifecycle:
 

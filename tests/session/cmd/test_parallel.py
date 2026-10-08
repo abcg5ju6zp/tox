@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
 import sys
 from argparse import ArgumentTypeError
-from signal import SIGINT
+from signal import SIGINT, SIGKILL, SIGTERM
 from subprocess import PIPE, Popen
 from textwrap import dedent
 from time import sleep
@@ -11,7 +13,7 @@ from unittest import mock
 
 import pytest
 
-from tox.session.cmd.run import parallel
+from tox.session.cmd.run import common, parallel
 from tox.session.cmd.run.parallel import parse_num_processes
 from tox.tox_env.api import ToxEnv
 from tox.tox_env.errors import Fail
@@ -346,3 +348,178 @@ def test_interrupt_logs_pkg_env_after_its_output_was_collected(
     out, err = capfd.readouterr()
     assert "interrupt tox environment: .pkg" in out, out
     assert "Logging error" not in err, err
+
+
+_DEPENDENCY_FAILURE_TOML = dedent("""\
+    env_list = ["a", "b", "c"]
+    [env_run_base]
+    package = "skip"
+    [env.a]
+    commands = [["python", "-c", "raise SystemExit(7)"]]
+    [env.b]
+    depends = ["a"]
+    commands = [["python", "-c", "print('successor ran')"]]
+    [env.c]
+    commands = [["python", "-c", "print('independent ran')"]]
+""")
+
+
+def test_parallel_dependency_failure_cancels_successors(tox_project: ToxProjectCreator) -> None:
+    """A failed environment cancels its successors; independent environments keep running."""
+    project = tox_project({"tox.toml": _DEPENDENCY_FAILURE_TOML})
+
+    outcome = project.run("p", "-p", "all")
+
+    outcome.assert_failed()
+    assert "successor ran" not in outcome.out
+    assert "a: FAIL code 7" in outcome.out
+    assert "  b: SKIP " in outcome.out
+    assert "  c: OK " in outcome.out
+    assert "b: cancelled (dependency a failed)" in outcome.out, outcome.out
+
+
+def test_parallel_dependency_failure_propagates_transitively(tox_project: ToxProjectCreator) -> None:
+    """Cancellation cascades along the dependency chain and the session ends instead of hanging."""
+    toml = dedent("""\
+        env_list = ["a", "b", "c"]
+        [env_run_base]
+        package = "skip"
+        [env.a]
+        commands = [["python", "-c", "raise SystemExit(1)"]]
+        [env.b]
+        depends = ["a"]
+        commands = [["python", "-c", "print('b ran')"]]
+        [env.c]
+        depends = ["b"]
+        commands = [["python", "-c", "print('c ran')"]]
+    """)
+    project = tox_project({"tox.toml": toml})
+
+    outcome = project.run("p", "-p", "all")
+
+    outcome.assert_failed()
+    assert "b ran" not in outcome.out
+    assert "c ran" not in outcome.out
+    assert "b: cancelled (dependency a failed)" in outcome.out, outcome.out
+    assert "c: cancelled (dependency b cancelled)" in outcome.out, outcome.out
+
+
+def test_parallel_cancelled_environment_in_result_json(tox_project: ToxProjectCreator) -> None:
+    """The JSON report records successors cancelled by a dependency failure as skipped failures."""
+    project = tox_project({"tox.toml": _DEPENDENCY_FAILURE_TOML})
+
+    outcome = project.run("p", "-p", "all", "--result-json", "report.json")
+
+    outcome.assert_failed()
+    report = json.loads((project.path / "report.json").read_text(encoding="utf-8"))["testenvs"]["b"]["result"]
+    assert report == {"success": False, "exit_code": -2, "duration": report["duration"], "skipped": True}
+
+
+def test_parallel_no_resume_flag(tox_project: ToxProjectCreator, mocker: MockerFixture) -> None:
+    opened = mocker.spy(common.SessionStatus, "open")
+    project = tox_project({
+        "tox.toml": 'env_list = ["a"]\n[env_run_base]\npackage = "skip"\ncommands = [["python", "-c", "pass"]]\n'
+    })
+
+    project.run("p", "-p", "1", "--no-resume")
+
+    assert opened.call_args.kwargs["resume"] is False
+
+
+_COUNT_CMD = (
+    "from pathlib import Path; p = Path('a.count'); "
+    "p.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')"
+)
+_WAIT_CMD = (
+    "from pathlib import Path; import time; Path('b.start').write_text(''); "
+    "(time.sleep(100) if not Path('b.release').exists() else Path('b.done').write_text('done'))"
+)
+_INTERRUPTED_SESSION_TOML = f"""\
+env_list = ["a", "b"]
+[env_run_base]
+package = "skip"
+[env.a]
+commands = [["python", "-c", "{_COUNT_CMD}"]]
+[env.b]
+depends = ["a"]
+commands = [["python", "-c", "{_WAIT_CMD}"]]
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="process groups and SIGTERM behave differently on Windows")
+@pytest.mark.flaky(max_runs=3, min_passes=1)
+@pytest.mark.timeout(180)
+def test_resume_after_termination_reuses_confirmed_environments(tox_project: ToxProjectCreator) -> None:
+    """After the process dies mid-session, a re-run reuses successful environments and finishes the unfinished ones."""
+    project = tox_project({"tox.toml": _INTERRUPTED_SESSION_TOML})
+    config = str(project.path / "tox.toml")
+    base_cmd = [sys.executable, "-m", "tox", "-c", config, "p", "-p", "2"]
+
+    first = Popen(base_cmd, stdout=PIPE, stderr=PIPE, cwd=project.path, start_new_session=True)
+    try:
+        while not ((project.path / "a.count").exists() and (project.path / "b.start").exists()):
+            if first.poll() is not None:  # pragma: no cover # surfaces a premature exit instead of hanging
+                out, err = first.communicate()
+                msg = f"first run ended early\n{out}\n{err}"
+                raise AssertionError(msg)
+            sleep(0.05)
+        os.killpg(os.getpgid(first.pid), SIGTERM)
+        out, err = first.communicate(timeout=60)
+    finally:
+        if first.poll() is None:  # pragma: no cover
+            os.killpg(os.getpgid(first.pid), SIGKILL)
+    assert first.returncode != 0
+
+    state_file = project.path / ".tox" / "session.json"
+    assert state_file.exists()
+    states = json.loads(state_file.read_text())["envs"]
+    assert states["a"]["status"] == "success"
+    assert states["b"]["status"] == "running"
+
+    (project.path / "b.release").write_text("")
+    second = Popen(base_cmd, stdout=PIPE, stderr=PIPE, cwd=project.path, universal_newlines=True)
+    out, _ = second.communicate(timeout=120)
+
+    assert second.returncode == 0, out
+    assert (project.path / "b.done").exists()
+    assert (project.path / "a.count").read_text() == "1"  # environment a was reused, never executed again
+    assert not state_file.exists()  # a naturally finished session has nothing left to resume
+    assert "  b: OK " in out
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="process groups and SIGTERM behave differently on Windows")
+@pytest.mark.flaky(max_runs=3, min_passes=1)
+@pytest.mark.timeout(180)
+def test_no_resume_reruns_confirmed_environments(tox_project: ToxProjectCreator) -> None:
+    """--no-resume discards the interrupted session and executes even environments that already succeeded."""
+    project = tox_project({"tox.toml": _INTERRUPTED_SESSION_TOML})
+    config = str(project.path / "tox.toml")
+    base_cmd = [sys.executable, "-m", "tox", "-c", config, "p", "-p", "2"]
+
+    first = Popen(base_cmd, stdout=PIPE, stderr=PIPE, cwd=project.path, start_new_session=True)
+    try:
+        while not ((project.path / "a.count").exists() and (project.path / "b.start").exists()):
+            if first.poll() is not None:  # pragma: no cover
+                out, err = first.communicate()
+                msg = f"first run ended early\n{out}\n{err}"
+                raise AssertionError(msg)
+            sleep(0.05)
+        os.killpg(os.getpgid(first.pid), SIGTERM)
+        first.communicate(timeout=60)
+    finally:
+        if first.poll() is None:  # pragma: no cover
+            os.killpg(os.getpgid(first.pid), SIGKILL)
+
+    (project.path / "b.release").write_text("")
+    second = Popen(
+        [*base_cmd, "--no-resume"],
+        stdout=PIPE,
+        stderr=PIPE,
+        cwd=project.path,
+        universal_newlines=True,
+    )
+    out, _ = second.communicate(timeout=120)
+
+    assert second.returncode == 0, out
+    assert (project.path / "a.count").read_text() == "2"  # a was executed again
+    assert "  a: OK " in out

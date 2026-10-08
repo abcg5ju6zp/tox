@@ -195,6 +195,7 @@ class Parsed(Namespace):
     package_only: bool
     install_pkg: Path | None
     fail_fast: bool
+    resume: bool
     develop: bool
     no_recreate_pkg: bool
     skip_pkg_install: bool
